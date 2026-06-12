@@ -147,12 +147,12 @@ export class OutboxPollerService implements OnModuleInit, OnModuleDestroy {
       const candidates = await tx.$queryRaw<
         Array<{ id: string }>
       >(Prisma.sql`
-        SELECT id FROM "outbox_events"
+        SELECT id FROM outbox_events
         WHERE (
-          "status" = 'PENDING'
-          OR ("status" = 'PROCESSING' AND "leased_until" < ${now})
+          status = 'PENDING'
+          OR (status = 'PROCESSING' AND leased_until < ${now})
         )
-        ORDER BY "created_at" ASC
+        ORDER BY created_at ASC
         LIMIT ${OUTBOX_POLL_BATCH_SIZE}
         FOR UPDATE SKIP LOCKED
       `);

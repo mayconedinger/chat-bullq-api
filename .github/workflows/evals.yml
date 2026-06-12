@@ -17,19 +17,18 @@ jobs:
     timeout-minutes: 20
 
     services:
-      postgres:
-        image: postgres:16
+      mysql:
+        image: mysql:8.0
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: chat_bullq_test
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: easysale_chat_test
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "mysqladmin ping -h localhost -proot"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
         ports:
-          - 5432:5432
+          - 3306:3306
 
       redis:
         image: redis:7
@@ -42,7 +41,7 @@ jobs:
           - 6379:6379
 
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chat_bullq_test
+      DATABASE_URL: mysql://root:root@localhost:3306/easysale_chat_test
       REDIS_HOST: localhost
       REDIS_PORT: '6379'
       NODE_ENV: test

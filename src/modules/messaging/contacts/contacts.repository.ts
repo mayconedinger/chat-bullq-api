@@ -16,9 +16,11 @@ export class ContactsRepository {
 
     if (search) {
       where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
+        // Sem `mode: 'insensitive'` (Postgres-only): a collation utf8mb4_unicode_ci
+        // do MySQL já faz o match case-insensitive.
+        { name: { contains: search } },
         { phone: { contains: search } },
-        { email: { contains: search, mode: 'insensitive' } },
+        { email: { contains: search } },
       ];
     }
 

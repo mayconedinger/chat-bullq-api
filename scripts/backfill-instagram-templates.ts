@@ -85,7 +85,8 @@ async function main() {
   const candidates = await prisma.message.findMany({
     where: {
       OR: [
-        { content: { path: ['text'], equals: '[template]' } },
+        // Prisma+MySQL usa JSON path string (Postgres usava array de segmentos).
+        { content: { path: '$.text', equals: '[template]' } },
         { type: MessageContentType.TEMPLATE },
       ],
     },

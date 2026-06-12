@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
@@ -837,7 +837,8 @@ model AiAgent {
 
   kind         AiAgentKind @default(WORKER)
   category     String?
-  capabilities String[]    @default([])
+  /// JSON array de strings — MySQL não suporta scalar lists.
+  capabilities Json        @default("[]")
 
   // ─── Organograma matricial ágil ────────────────────────────
   // parentAgentId: chefia direta — quem este agent reporta. Null = raiz (CEO/diretoria).
@@ -872,7 +873,8 @@ model AiAgent {
   // Default: ORCHESTRATOR/sales = persistente; WORKER suporte = curto.
   // Ajustável por agent no Jarvis.
   followUpEnabled      Boolean @default(true) @map("follow_up_enabled")
-  followUpCadenceHours Int[]   @default([4, 24, 72, 168, 336]) @map("follow_up_cadence_hours")
+  /// JSON array de int (horas) — MySQL não suporta scalar lists.
+  followUpCadenceHours Json    @default("[4, 24, 72, 168, 336]") @map("follow_up_cadence_hours")
 
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
@@ -1370,7 +1372,8 @@ model Product {
   price           String? // texto livre: "R$ 4.500 ou 6x R$ 750"
   paymentLink     String?  @map("payment_link")
   targetAudience  String?  @map("target_audience")
-  differentiators String[] @default([])
+  /// JSON array de strings — MySQL não suporta scalar lists.
+  differentiators Json     @default("[]")
   isActive        Boolean  @default(true) @map("is_active")
   order           Int      @default(0)
   metadata        Json     @default("{}")
@@ -1557,4 +1560,30 @@ model AutomationRun {
   @@index([traceId], name: "idx_run_trace")
   @@index([status, startedAt(sort: Desc)], name: "idx_run_status_time")
   @@map("automation_runs")
+}
+
+// ─── RAG Vector Store ────────────────────────────
+// Antes da migração para MySQL esta tabela vivia fora do Prisma
+// (Postgres + pgvector, SQL cru). No MySQL o embedding é um Float32Array
+// serializado em BLOB e a similaridade de cosseno é calculada na aplicação
+// (VectorStoreService) — adequado até ~dezenas de milhares de entradas.
+
+model AiVectorEntry {
+  id             String   @id
+  ownerType      String   @map("owner_type") // 'message' | 'fact' | 'memory_summary'
+  ownerId        String   @map("owner_id")
+  conversationId String?  @map("conversation_id")
+  agentId        String?  @map("agent_id")
+  contactId      String?  @map("contact_id")
+  content        String   @db.Text
+  /// Float32Array (1536 dims, text-embedding-3-small) serializado little-endian.
+  embedding      Bytes
+  metadata       Json     @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([ownerType, ownerId])
+  @@index([conversationId])
+  @@index([agentId])
+  @@index([contactId])
+  @@map("ai_vector_entries")
 }

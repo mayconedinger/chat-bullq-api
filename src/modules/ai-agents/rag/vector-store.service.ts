@@ -3,91 +3,61 @@ import { PrismaService } from '../../../database/prisma.service';
 import type { SearchResult, SearchScope, VectorEntry } from './types';
 
 /**
- * Postgres + pgvector backed store for RAG entries.
+ * MySQL-backed store for RAG entries (tabela `ai_vector_entries`, modelada
+ * no Prisma como `AiVectorEntry`).
  *
- * The schema is NOT in `prisma.schema` yet — pgvector is a Postgres
- * extension that Prisma can't model natively (it would treat `vector(1536)`
- * as `Unsupported`). We talk to the table via raw SQL through Prisma.
+ * MySQL não tem equivalente ao pgvector, então:
+ * - o embedding (1536 floats) é serializado como Float32Array em BLOB
+ *   (~6 KB/linha vs ~19 KB do JSON text);
+ * - a busca filtra candidatos pelo escopo via índices normais e calcula a
+ *   similaridade de cosseno na aplicação.
  *
- * ─────────────────────────────────────────────────────────────────────
- *  MIGRATION SQL (run manually in Phase 2 — NOT executed by this code):
- * ─────────────────────────────────────────────────────────────────────
- *
- *  CREATE EXTENSION IF NOT EXISTS vector;
- *
- *  CREATE TABLE ai_vector_entries (
- *    id              text PRIMARY KEY,
- *    owner_type      text NOT NULL,           -- 'message' | 'fact' | 'memory_summary'
- *    owner_id        text NOT NULL,           -- FK in the source domain
- *    conversation_id text,
- *    agent_id        text,
- *    contact_id      text,
- *    content         text NOT NULL,           -- original text (returned at search time)
- *    embedding       vector(1536) NOT NULL,   -- text-embedding-3-small dims
- *    metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
- *    created_at      timestamptz NOT NULL DEFAULT now()
- *  );
- *
- *  -- Filter indexes for the scope predicates.
- *  CREATE INDEX ai_vector_entries_owner_idx        ON ai_vector_entries(owner_type, owner_id);
- *  CREATE INDEX ai_vector_entries_conversation_idx ON ai_vector_entries(conversation_id);
- *  CREATE INDEX ai_vector_entries_agent_idx        ON ai_vector_entries(agent_id);
- *  CREATE INDEX ai_vector_entries_contact_idx      ON ai_vector_entries(contact_id);
- *
- *  -- Approximate nearest neighbour index for cosine distance.
- *  -- `lists = 100` is fine for tens of thousands of rows; tune up for >1M.
- *  CREATE INDEX ai_vector_entries_embedding_idx
- *    ON ai_vector_entries
- *    USING ivfflat (embedding vector_cosine_ops)
- *    WITH (lists = 100);
- *
- *  -- After bulk inserts, run:  ANALYZE ai_vector_entries;
- *  -- ivfflat needs ANALYZE to build its centroids.
- *
- * ─────────────────────────────────────────────────────────────────────
+ * Trade-off dimensionado: com escopo (agent/contact/conversation) o conjunto
+ * de candidatos é pequeno; sem escopo, o fetch é limitado aos
+ * `CANDIDATE_LIMIT` mais recentes. Adequado até dezenas de milhares de
+ * entradas por escopo — acima disso, migrar para MySQL 9 `VECTOR` ou um
+ * serviço de busca vetorial dedicado.
  */
 @Injectable()
 export class VectorStoreService {
   private readonly logger = new Logger(VectorStoreService.name);
 
+  /** Máximo de candidatos carregados do banco por busca. */
+  private static readonly CANDIDATE_LIMIT = 2000;
+
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * Inserts or updates a single vector entry. Uses `ON CONFLICT (id) DO
-   * UPDATE` so re-indexing a message overwrites instead of duplicating.
+   * Insere ou atualiza uma entrada. Re-indexar uma mensagem sobrescreve em
+   * vez de duplicar (id é determinístico: `${ownerType}:${ownerId}`).
    */
   async upsert(entry: VectorEntry): Promise<void> {
-    const vectorLiteral = this.toVectorLiteral(entry.embedding);
+    const embedding = this.encodeEmbedding(entry.embedding);
+    const data = {
+      ownerType: entry.ownerType,
+      ownerId: entry.ownerId,
+      conversationId: entry.conversationId ?? null,
+      agentId: entry.agentId ?? null,
+      contactId: entry.contactId ?? null,
+      content: entry.content,
+      embedding,
+      metadata: entry.metadata ?? {},
+    };
 
-    await this.prisma.$executeRawUnsafe(
-      `
-      INSERT INTO ai_vector_entries
-        (id, owner_type, owner_id, conversation_id, agent_id, contact_id, content, embedding, metadata)
-      VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9::jsonb)
-      ON CONFLICT (id) DO UPDATE SET
-        embedding = EXCLUDED.embedding,
-        content   = EXCLUDED.content,
-        metadata  = EXCLUDED.metadata
-      `,
-      entry.id,
-      entry.ownerType,
-      entry.ownerId,
-      entry.conversationId ?? null,
-      entry.agentId ?? null,
-      entry.contactId ?? null,
-      entry.content,
-      vectorLiteral,
-      JSON.stringify(entry.metadata ?? {}),
-    );
+    await this.prisma.aiVectorEntry.upsert({
+      where: { id: entry.id },
+      create: { id: entry.id, ...data },
+      update: {
+        embedding,
+        content: entry.content,
+        metadata: entry.metadata ?? {},
+      },
+    });
   }
 
   /**
-   * Bulk-upsert. Currently a sequential loop — pgvector + Prisma raw
-   * doesn't ergonomically express a multi-row VALUES with vector casts,
-   * and the indexer queue is concurrent at the job level anyway. If
-   * throughput becomes a bottleneck, switch to `INSERT ... SELECT FROM
-   * unnest(...)` with parallel arrays.
+   * Bulk-upsert sequencial — o indexer já é concorrente no nível do job
+   * BullMQ; se virar gargalo, trocar por `createMany` + update dos conflitos.
    */
   async upsertMany(entries: VectorEntry[]): Promise<void> {
     for (const entry of entries) {
@@ -96,12 +66,8 @@ export class VectorStoreService {
   }
 
   /**
-   * Cosine similarity search.
-   *
-   * `embedding <=> $1::vector` is the pgvector cosine *distance* operator
-   * (0 = identical, 2 = opposite). We convert to similarity via `1 - d`
-   * so the score returned to the caller is the familiar 0..1 range
-   * (higher = more similar).
+   * Busca por similaridade de cosseno (0..1, maior = mais similar),
+   * calculada na aplicação sobre os candidatos do escopo.
    */
   async search(
     queryVector: number[],
@@ -109,99 +75,108 @@ export class VectorStoreService {
     k = 5,
     minScore = 0.7,
   ): Promise<SearchResult[]> {
-    const vec = this.toVectorLiteral(queryVector);
-
-    const filters: string[] = [];
-    const params: any[] = [vec, k];
-    let p = 3;
-
-    if (scope.agentId) {
-      filters.push(`agent_id = $${p++}`);
-      params.push(scope.agentId);
-    }
-    if (scope.contactId) {
-      filters.push(`contact_id = $${p++}`);
-      params.push(scope.contactId);
-    }
-    if (scope.conversationId) {
-      filters.push(`conversation_id = $${p++}`);
-      params.push(scope.conversationId);
-    }
+    const where: Record<string, unknown> = {};
+    if (scope.agentId) where.agentId = scope.agentId;
+    if (scope.contactId) where.contactId = scope.contactId;
+    if (scope.conversationId) where.conversationId = scope.conversationId;
     if (scope.ownerType && scope.ownerType !== 'any') {
-      filters.push(`owner_type = $${p++}`);
-      params.push(scope.ownerType);
+      where.ownerType = scope.ownerType;
     }
 
-    const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+    const candidates = await this.prisma.aiVectorEntry.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: VectorStoreService.CANDIDATE_LIMIT,
+    });
 
-    const rows = await this.prisma.$queryRawUnsafe<Array<Record<string, any>>>(
-      `
-      SELECT
-        id,
-        owner_type,
-        owner_id,
-        conversation_id,
-        agent_id,
-        contact_id,
-        content,
-        metadata,
-        created_at,
-        1 - (embedding <=> $1::vector) AS score
-      FROM ai_vector_entries
-      ${where}
-      ORDER BY embedding <=> $1::vector ASC
-      LIMIT $2
-      `,
-      ...params,
-    );
+    if (candidates.length === VectorStoreService.CANDIDATE_LIMIT) {
+      this.logger.warn(
+        `Vector search hit candidate cap (${VectorStoreService.CANDIDATE_LIMIT}) — ` +
+          `scope ${JSON.stringify(scope)}; resultados antigos podem ficar de fora.`,
+      );
+    }
 
-    return rows
-      .filter((r) => Number(r.score) >= minScore)
-      .map((r) => ({
-        entry: {
-          id: r.id,
-          ownerType: r.owner_type,
-          ownerId: r.owner_id,
-          conversationId: r.conversation_id ?? undefined,
-          agentId: r.agent_id ?? undefined,
-          contactId: r.contact_id ?? undefined,
-          content: r.content,
-          embedding: [], // search omits the raw vector to save bandwidth
-          metadata: r.metadata ?? {},
-          createdAt:
-            r.created_at instanceof Date
-              ? r.created_at.toISOString()
-              : String(r.created_at),
-        },
-        score: Number(r.score),
-      }));
+    const query = Float32Array.from(queryVector);
+    const queryNorm = this.norm(query);
+
+    return candidates
+      .map((row) => {
+        const vec = this.decodeEmbedding(row.embedding);
+        return {
+          entry: {
+            id: row.id,
+            ownerType: row.ownerType as VectorEntry['ownerType'],
+            ownerId: row.ownerId,
+            conversationId: row.conversationId ?? undefined,
+            agentId: row.agentId ?? undefined,
+            contactId: row.contactId ?? undefined,
+            content: row.content,
+            embedding: [], // search omite o vetor cru pra economizar banda
+            metadata: (row.metadata as Record<string, any>) ?? {},
+            createdAt: row.createdAt.toISOString(),
+          },
+          score: this.cosineSimilarity(query, queryNorm, vec),
+        };
+      })
+      .filter((r) => r.score >= minScore)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k);
   }
 
   async delete(id: string): Promise<void> {
-    await this.prisma.$executeRawUnsafe(
-      `DELETE FROM ai_vector_entries WHERE id = $1`,
-      id,
-    );
+    await this.prisma.aiVectorEntry.deleteMany({ where: { id } });
   }
 
   /**
-   * Removes every entry tied to a given owner. Useful when a fact is
-   * deleted upstream and we want the vector store to reflect that.
+   * Remove toda entrada ligada a um owner. Útil quando um fact é deletado
+   * upstream e o vector store precisa refletir isso.
    */
-  async deleteByOwner(ownerType: VectorEntry['ownerType'], ownerId: string): Promise<void> {
-    await this.prisma.$executeRawUnsafe(
-      `DELETE FROM ai_vector_entries WHERE owner_type = $1 AND owner_id = $2`,
-      ownerType,
-      ownerId,
+  async deleteByOwner(
+    ownerType: VectorEntry['ownerType'],
+    ownerId: string,
+  ): Promise<void> {
+    await this.prisma.aiVectorEntry.deleteMany({
+      where: { ownerType, ownerId },
+    });
+  }
+
+  // ─── Serialização & matemática ─────────────────────────────────────
+
+  private encodeEmbedding(vector: number[]): Uint8Array<ArrayBuffer> {
+    const floats = Float32Array.from(vector);
+    return new Uint8Array(floats.buffer, 0, floats.byteLength);
+  }
+
+  private decodeEmbedding(blob: Uint8Array): Float32Array {
+    // slice() garante um ArrayBuffer próprio e alinhado (byteOffset 0).
+    const copy = blob.slice();
+    return new Float32Array(
+      copy.buffer,
+      0,
+      copy.byteLength / Float32Array.BYTES_PER_ELEMENT,
     );
   }
 
-  /**
-   * pgvector accepts both binary and text representations. The text form
-   * `'[1,2,3]'::vector` is what the Postgres driver passes through
-   * cleanly without binary protocol gymnastics.
-   */
-  private toVectorLiteral(vector: number[]): string {
-    return `[${vector.join(',')}]`;
+  private norm(v: Float32Array): number {
+    let sum = 0;
+    for (let i = 0; i < v.length; i++) sum += v[i] * v[i];
+    return Math.sqrt(sum);
+  }
+
+  private cosineSimilarity(
+    query: Float32Array,
+    queryNorm: number,
+    candidate: Float32Array,
+  ): number {
+    if (query.length !== candidate.length || queryNorm === 0) return 0;
+    let dot = 0;
+    let candSum = 0;
+    for (let i = 0; i < query.length; i++) {
+      dot += query[i] * candidate[i];
+      candSum += candidate[i] * candidate[i];
+    }
+    const candNorm = Math.sqrt(candSum);
+    if (candNorm === 0) return 0;
+    return dot / (queryNorm * candNorm);
   }
 }

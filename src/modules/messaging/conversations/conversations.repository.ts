@@ -129,7 +129,8 @@ export class ConversationsRepository {
     if (filters.stuckOnly) where.isStuck = true;
     if (filters.search) {
       where.OR = [
-        { contact: { name: { contains: filters.search, mode: 'insensitive' } } },
+        // Collation utf8mb4_unicode_ci do MySQL já é case-insensitive.
+        { contact: { name: { contains: filters.search } } },
         { contact: { phone: { contains: filters.search } } },
         { protocol: { contains: filters.search } },
       ];
