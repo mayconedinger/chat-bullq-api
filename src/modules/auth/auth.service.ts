@@ -8,12 +8,26 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import type { SignOptions } from 'jsonwebtoken';
+import { randomBytes } from 'crypto';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../../database/prisma.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 
 const BCRYPT_ROUNDS = 12;
+
+/** Claims do token SSO emitido pelo EasyManager (sso-token.php). */
+interface EasysaleSsoPayload {
+  iss: string;
+  aud: string;
+  sub: string; // "easysale:<admin_id>"
+  email: string;
+  name: string;
+  org_slug: string;
+  org_name: string;
+  role: 'OWNER' | 'ADMIN' | 'AGENT';
+  permissions: string[];
+}
 
 @Injectable()
 export class AuthService {
@@ -25,7 +39,125 @@ export class AuthService {
     private readonly config: ConfigService,
   ) {}
 
+  /**
+   * Com SSO do EasySale ativo, cadastro e login nativos saem de cena —
+   * identidade passa a ser exclusivamente do EasyManager.
+   */
+  private assertNativeAuthEnabled() {
+    if (this.config.get<string>('EASYSALE_SSO_ONLY') === 'true') {
+      throw new UnauthorizedException(
+        'Autenticação nativa desativada — use o login do EasyManager',
+      );
+    }
+  }
+
+  /**
+   * Troca um token SSO do EasyManager por tokens próprios do chat-api,
+   * provisionando user/org/membership just-in-time. O EasySale é a fonte
+   * de verdade: nome, role e vínculo de org são sobrescritos a cada troca.
+   */
+  async exchangeEasysaleToken(token: string) {
+    const secret = this.config.get<string>('EASYSALE_SSO_SECRET');
+    if (!secret) {
+      this.logger.error('EASYSALE_SSO_SECRET não configurado');
+      throw new UnauthorizedException('SSO do EasySale não configurado');
+    }
+
+    let payload: EasysaleSsoPayload;
+    try {
+      payload = this.jwt.verify<EasysaleSsoPayload>(token, { secret });
+    } catch {
+      throw new UnauthorizedException('Token SSO inválido ou expirado');
+    }
+
+    if (payload.iss !== 'easysale-manager' || payload.aud !== 'chat-api') {
+      throw new UnauthorizedException('Token SSO inválido');
+    }
+    if (!payload.email || !payload.org_slug || !payload.role) {
+      throw new UnauthorizedException('Token SSO incompleto');
+    }
+
+    const user = await this.prisma.$transaction(async (tx) => {
+      let organization = await tx.organization.findUnique({
+        where: { slug: payload.org_slug },
+      });
+      if (!organization) {
+        organization = await tx.organization.create({
+          data: { name: payload.org_name, slug: payload.org_slug },
+        });
+        await tx.department.create({
+          data: {
+            organizationId: organization.id,
+            name: 'Geral',
+            description: 'Departamento padrão',
+            isDefault: true,
+          },
+        });
+      }
+
+      // Usuários SSO não têm senha utilizável — hash de bytes aleatórios
+      // só para satisfazer o NOT NULL (login nativo fica desativado).
+      const unusablePassword = await bcrypt.hash(
+        randomBytes(32).toString('hex'),
+        BCRYPT_ROUNDS,
+      );
+
+      const user = await tx.user.upsert({
+        where: { email: payload.email },
+        create: {
+          name: payload.name,
+          email: payload.email,
+          password: unusablePassword,
+        },
+        update: { name: payload.name, isActive: true, deletedAt: null },
+      });
+
+      const membership = await tx.userOrganization.upsert({
+        where: {
+          userId_organizationId: {
+            userId: user.id,
+            organizationId: organization.id,
+          },
+        },
+        create: {
+          userId: user.id,
+          organizationId: organization.id,
+          role: payload.role,
+        },
+        update: { role: payload.role },
+      });
+
+      const inDepartment = await tx.departmentAgent.findFirst({
+        where: { userOrganizationId: membership.id },
+      });
+      if (!inDepartment) {
+        const defaultDept = await tx.department.findFirst({
+          where: { organizationId: organization.id, isDefault: true },
+        });
+        if (defaultDept) {
+          await tx.departmentAgent.create({
+            data: {
+              departmentId: defaultDept.id,
+              userOrganizationId: membership.id,
+            },
+          });
+        }
+      }
+
+      return user;
+    });
+
+    this.logger.log(`SSO EasySale: ${payload.email} (${payload.role})`);
+
+    // Mesmo shape do login(): user + organizations + tokens do chat-api.
+    const session = await this.getMe(user.id);
+    const tokens = await this.generateTokens(user.id, user.email);
+    return { ...session, ...tokens };
+  }
+
   async register(dto: RegisterDto) {
+    this.assertNativeAuthEnabled();
+
     const existing = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
@@ -212,6 +344,8 @@ export class AuthService {
   }
 
   async login(dto: LoginDto) {
+    this.assertNativeAuthEnabled();
+
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });

@@ -4,6 +4,7 @@ import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshDto } from './dto/refresh.dto';
+import { EasysaleExchangeDto } from './dto/easysale-exchange.dto';
 import { JwtAuthGuard } from '../../common/guards';
 import { CurrentUser } from '../../common/decorators';
 
@@ -28,6 +29,15 @@ export class AuthController {
   @ApiOperation({ summary: 'Refresh access token' })
   refresh(@Body() dto: RefreshDto) {
     return this.authService.refresh(dto.refreshToken);
+  }
+
+  @Post('easysale/exchange')
+  @ApiOperation({
+    summary:
+      'Troca token SSO do EasyManager por tokens do chat-api (JIT provisioning)',
+  })
+  exchangeEasysale(@Body() dto: EasysaleExchangeDto) {
+    return this.authService.exchangeEasysaleToken(dto.token);
   }
 
   @Get('me')
